@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-ALBERT POLYMARKET FAST-LOOP v2.0
-================================
-Integrated Simmer FastLoop logic for Polymarket BTC/ETH/SOL 5m/15m sprints.
+ALBERT POLYMARKET FAST-LOOP v3.0 (EXECUTION READY)
+==================================================
+Integrated with Simmer SDK for real-time Polymarket execution.
+Handles BTC/ETH/SOL sprints based on momentum.
 """
 
 import os
@@ -25,49 +26,41 @@ sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='repla
 ssl_context = ssl._create_unverified_context()
 
 # =============================================================================
-# Configuration Schema
+# Configuration
 # =============================================================================
-CONFIG_SCHEMA = {
-    "entry_threshold": {"default": 0.05, "env": "SIMMER_SPRINT_ENTRY", "type": float},
-    "min_momentum_pct": {"default": 0.5, "env": "SIMMER_SPRINT_MOMENTUM", "type": float},
-    "max_position": {"default": 5.0, "env": "SIMMER_SPRINT_MAX_POSITION", "type": float},
-    "signal_source": {"default": "binance", "env": "SIMMER_SPRINT_SIGNAL", "type": str},
-    "lookback_minutes": {"default": 5, "env": "SIMMER_SPRINT_LOOKBACK", "type": int},
-    "min_time_remaining": {"default": 60, "env": "SIMMER_SPRINT_MIN_TIME", "type": int},
-    "asset": {"default": "BTC", "env": "SIMMER_SPRINT_ASSET", "type": str},
-    "window": {"default": "5m", "env": "SIMMER_SPRINT_WINDOW", "type": str},
-    "volume_confidence": {"default": True, "env": "SIMMER_SPRINT_VOL_CONF", "type": bool},
-    "daily_budget": {"default": 10.0, "env": "SIMMER_SPRINT_DAILY_BUDGET", "type": float},
-}
+SIMMER_API_KEY = os.getenv("SIMMER_API_KEY", "")
+ASSET = os.getenv("SIMMER_SPRINT_ASSET", "BTC").upper()
+WINDOW = os.getenv("SIMMER_SPRINT_WINDOW", "5m")
+MIN_MOMENTUM_PCT = float(os.getenv("SIMMER_SPRINT_MOMENTUM", "0.5"))
+MAX_POSITION = float(os.getenv("SIMMER_SPRINT_MAX_POSITION", "5.0"))
 
 ASSET_SYMBOLS = {"BTC": "BTCUSDT", "ETH": "ETHUSDT", "SOL": "SOLUSDT"}
 ASSET_PATTERNS = {"BTC": ["bitcoin up or down"], "ETH": ["ethereum up or down"], "SOL": ["solana up or down"]}
 TRADE_SOURCE = "albert:fastloop"
 
 # =============================================================================
-# Config Helpers
+# Simmer Integration
 # =============================================================================
-def _load_config(schema, skill_file):
-    from pathlib import Path
-    config_path = Path(skill_file).parent / "config_fastloop.json"
-    file_cfg = {}
-    if config_path.exists():
+_client = None
+def get_client():
+    global _client
+    if _client is None:
         try:
-            with open(config_path) as f:
-                file_cfg = json.load(f)
-        except: pass
-    
-    result = {}
-    for key, spec in schema.items():
-        if key in file_cfg:
-            result[key] = file_cfg[key]
-        elif spec.get("env") and os.environ.get(spec["env"]):
-            val = os.environ.get(spec["env"])
-            type_fn = spec.get("type", str)
-            result[key] = type_fn(val) if type_fn != bool else val.lower() in ("true", "1", "yes")
-        else:
-            result[key] = spec.get("default")
-    return result
+            from simmer_sdk import SimmerClient
+        except ImportError:
+            print("❌ simmer-sdk not installed.")
+            return None
+        
+        if not SIMMER_API_KEY:
+            print("❌ SIMMER_API_KEY not set in environment.")
+            return None
+            
+        try:
+            _client = SimmerClient(api_key=SIMMER_API_KEY, venue="polymarket")
+        except Exception as e:
+            print(f"❌ Failed to init SimmerClient: {e}")
+            return None
+    return _client
 
 # =============================================================================
 # API Helpers
@@ -76,7 +69,7 @@ def _api_request(url, method="GET", data=None, headers=None, timeout=15):
     try:
         req_headers = headers or {}
         if "User-Agent" not in req_headers:
-            req_headers["User-Agent"] = "albert-fastloop/1.0"
+            req_headers["User-Agent"] = "albert-fastloop/3.0"
         body = json.dumps(data).encode("utf-8") if data else None
         if data: req_headers["Content-Type"] = "application/json"
         req = Request(url, data=body, headers=req_headers, method=method)
@@ -88,6 +81,36 @@ def _api_request(url, method="GET", data=None, headers=None, timeout=15):
 # =============================================================================
 # Discovery & Momentum
 # =============================================================================
+def get_coingecko_price(asset="BTC"):
+    cg_id = {"BTC": "bitcoin", "ETH": "ethereum", "SOL": "solana"}.get(asset, "bitcoin")
+    url = f"https://api.coingecko.com/api/v3/simple/price?ids={cg_id}&vs_currencies=usd"
+    result = _api_request(url)
+    if result and cg_id in result:
+        return result[cg_id]["usd"]
+    return None
+
+def get_momentum(asset="BTC", lookback=5):
+    # Try Binance first (simulated via multiple bases)
+    bases = ["https://api.binance.com", "https://api1.binance.com", "https://api-gcp.binance.com"]
+    symbol = ASSET_SYMBOLS.get(asset, "BTCUSDT")
+    
+    for base in bases:
+        url = f"{base}/api/v3/klines?symbol={symbol}&interval=1m&limit={lookback}"
+        result = _api_request(url)
+        if result and not isinstance(result, dict):
+            try:
+                price_then = float(result[0][1])
+                price_now = float(result[-1][4])
+                momentum_pct = ((price_now - price_then) / price_then) * 100
+                return {"momentum_pct": momentum_pct, "price_now": price_now, "direction": "up" if momentum_pct > 0 else "down"}
+            except: continue
+            
+    # Fallback to current price only (0 momentum)
+    price = get_coingecko_price(asset)
+    if price:
+        return {"momentum_pct": 0.0, "price_now": price, "direction": "neutral"}
+    return None
+
 def discover_markets(asset="BTC", window="5m"):
     patterns = ASSET_PATTERNS.get(asset, ["bitcoin up or down"])
     url = "https://gamma-api.polymarket.com/markets?limit=20&closed=false&tag=crypto&order=createdAt&ascending=false"
@@ -102,67 +125,69 @@ def discover_markets(asset="BTC", window="5m"):
             found.append(m)
     return found
 
-def get_momentum(asset="BTC", lookback=5):
-    # Use Coingecko as primary for now since Binance is blocked/failing
-    coingecko_id = {"BTC": "bitcoin", "ETH": "ethereum", "SOL": "solana"}.get(asset, "bitcoin")
-    url = f"https://api.coingecko.com/api/v3/simple/price?ids={coingecko_id}&vs_currencies=usd"
-    result = _api_request(url)
-    
-    if result and coingecko_id in result:
-        price_now = result[coingecko_id]["usd"]
-        # Since Coingecko simple price doesn't give momentum, we'll simulate it for the test
-        # or use a default 0.0 momentum for the dry run.
-        return {"momentum_pct": 0.0, "price_now": price_now, "direction": "neutral"}
-    return None
-
 # =============================================================================
 # Execution
 # =============================================================================
 def run_cycle(dry_run=True):
-    cfg = _load_config(CONFIG_SCHEMA, __file__)
     print(f"\n--- Albert FastLoop Cycle [{datetime.now().strftime('%H:%M:%S')}] ---")
-    print(f"Target: {cfg['asset']} {cfg['window']} | Momentum Req: {cfg['min_momentum_pct']}%")
+    print(f"Target: {ASSET} {WINDOW} | Req: {MIN_MOMENTUM_PCT}% | Mode: {'DRY' if dry_run else 'LIVE'}")
     
-    # 1. Check Momentum
-    mom = get_momentum(cfg['asset'], cfg['lookback_minutes'])
+    mom = get_momentum(ASSET)
     if not mom:
-        print("❌ Failed to get Binance data.")
+        print("❌ Failed to get market data.")
         return
     
-    print(f"Momentum: {mom['momentum_pct']:+.3f}% | Price: ${mom['price_now']:,.2f}")
+    print(f"Price: ${mom['price_now']:,.2f} | Momentum: {mom['momentum_pct']:+.3f}%")
     
-    if abs(mom['momentum_pct']) < cfg['min_momentum_pct']:
-        print("⏸️ Momentum too weak. Skipping.")
+    if abs(mom['momentum_pct']) < MIN_MOMENTUM_PCT:
+        print("⏸️ Waiting for stronger momentum...")
         return
 
-    # 2. Discover Markets
-    markets = discover_markets(cfg['asset'], cfg['window'])
+    markets = discover_markets(ASSET, WINDOW)
     if not markets:
         print("⏸️ No active sprint markets found.")
         return
 
-    m = markets[0] # Take the freshest
-    print(f"🎯 Market: {m['question']}")
-    
-    # 3. Decision
-    side = "YES" if mom['direction'] == "up" else "NO"
+    best_m = markets[0]
+    print(f"🎯 Target: {best_m['question']}")
+    side = "yes" if mom['direction'] == "up" else "no"
     
     if dry_run:
-        print(f"🧪 [DRY RUN] Would buy {side} on '{m['question']}' | Size: ${cfg['max_position']}")
+        print(f"🧪 [DRY RUN] Would buy {side.upper()} for ${MAX_POSITION}")
     else:
-        api_key = os.environ.get("SIMMER_API_KEY")
-        if not api_key:
-            print("❌ SIMMER_API_KEY not set. Cannot trade live.")
-            return
+        client = get_client()
+        if not client: return
         
-        # Real execution would use simmer_sdk here
-        print(f"🔴 [LIVE] Attempting {side} trade for ${cfg['max_position']}...")
+        print(f"🔴 [LIVE] Executing {side.upper()} trade...")
+        try:
+            # 1. Import market to Simmer
+            import_res = client.import_market(f"https://polymarket.com/event/{best_m['slug']}")
+            market_id = import_res.get("market_id")
+            
+            if not market_id:
+                print(f"❌ Import failed: {import_res.get('error')}")
+                return
+                
+            # 2. Execute Trade
+            result = client.trade(market_id=market_id, side=side, amount=MAX_POSITION, source=TRADE_SOURCE)
+            if result.success:
+                print(f"✅ SUCCESS! Bought {result.shares_bought:.1f} shares. Trade ID: {result.trade_id}")
+            else:
+                print(f"❌ Trade failed: {result.error}")
+        except Exception as e:
+            print(f"❌ SDK Error: {e}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--live", action="store_true")
     args = parser.parse_args()
     
+    # Check client on startup if live
+    if args.live:
+        if not get_client():
+            sys.exit(1)
+        print("💪 Simmer SDK Connected. Live Execution Ready.")
+
     while True:
         try:
             run_cycle(dry_run=not args.live)
